@@ -16,6 +16,7 @@ import android.media.projection.MediaProjectionManager
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.os.Looper
 import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.view.Gravity
@@ -31,12 +32,16 @@ class BotService : Service() {
     private var reader: ImageReader? = null
     private val thread = HandlerThread("scan").apply { start() }
     private val handler by lazy { Handler(thread.looper) }
+    private val main = Handler(Looper.getMainLooper())
     @Volatile private var running = false
+    @Volatile private var prev: IntArray? = null
     private var fullW = 0
     private var fullH = 0
+    private var tx = 0f
     private var lastX = -1f
     private var lastT = 0L
     private var cooldownUntil = 0L
+    private var lastShown = 0L
 
     override fun onBind(i: Intent?): IBinder? = null
 
@@ -76,6 +81,7 @@ class BotService : Service() {
         fullH = real.heightPixels
         val w = fullW / Config.SCALE
         val h = fullH / Config.SCALE
+        tx = w * Config.TARGET_X
         reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
         projection!!.createVirtualDisplay(
             "scan", w, h, real.densityDpi / Config.SCALE,
@@ -83,21 +89,22 @@ class BotService : Service() {
         )
         reader!!.setOnImageAvailableListener({ r ->
             val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
-            try { if (running) onFrame(img, h) } finally { img.close() }
+            try { if (running) onFrame(img, w, h) } finally { img.close() }
         }, handler)
     }
 
     private fun showOverlay() {
         val tv = TextView(this).apply {
             text = "▶"
-            textSize = 22f
+            textSize = 20f
             setTextColor(Color.WHITE)
             setBackgroundColor(0xAA000000.toInt())
             setPadding(32, 16, 32, 16)
             setOnClickListener {
                 running = !running
-                text = if (running) "⏸" else "▶"
+                prev = null
                 lastX = -1f
+                text = if (running) "⏸" else "▶"
             }
         }
         val lp = WindowManager.LayoutParams(
@@ -111,37 +118,94 @@ class BotService : Service() {
         overlay = tv
     }
 
-    private fun onFrame(img: Image, h: Int) {
+    private fun sample(img: Image, w: Int, h: Int): IntArray {
+        val p = img.planes[0]
+        val buf = p.buffer
+        val rs = p.rowStride
+        val ps = p.pixelStride
+        val y0 = (h * Config.BAND_TOP).toInt()
+        val y1 = (h * Config.BAND_BOTTOM).toInt()
+        val rows = (y1 - y0) / 8
+        val cols = w / 2
+        val out = IntArray(rows * cols)
+        for (r in 0 until rows) {
+            val base = (y0 + r * 8) * rs
+            for (c in 0 until cols) {
+                val o = base + c * 2 * ps
+                out[r * cols + c] = ((buf.get(o).toInt() and 255) +
+                        (buf.get(o + 1).toInt() and 255) +
+                        (buf.get(o + 2).toInt() and 255)) / 3
+            }
+        }
+        return out
+    }
+
+    private fun moverX(a: IntArray, b: IntArray, w: Int): Float? {
+        val cols = w / 2
+        val rows = b.size / cols
+        val colCount = IntArray(cols)
+        var total = 0
+        for (r in 0 until rows) {
+            for (c in 0 until cols) {
+                if (abs(b[r * cols + c] - a[r * cols + c]) > Config.DIFF_T) {
+                    colCount[c]++
+                    total++
+                }
+            }
+        }
+        if (total > b.size / 5) return null
+        var l = -1
+        var rr = -1
+        for (c in 0 until cols) {
+            if (colCount[c] >= 2) {
+                if (l < 0) l = c
+                rr = c
+            }
+        }
+        if (l < 0) return null
+        return (l + rr).toFloat()
+    }
+
+    private fun show(mx: Float) {
+        val n = SystemClock.uptimeMillis()
+        if (n - lastShown < 200) return
+        lastShown = n
+        val t = "⏸ ${mx.toInt()}|${tx.toInt()}"
+        main.post { overlay?.text = t }
+    }
+
+    private fun onFrame(img: Image, w: Int, h: Int) {
+        val cur = sample(img, w, h)
+        val p = prev
+        prev = cur
+        if (p == null || p.size != cur.size) return
         val now = SystemClock.uptimeMillis()
-        if (now < cooldownUntil) return
-        val top = Detector.span(img, (h * Config.MOVING_ROW).toInt())
-        val tower = Detector.span(img, (h * Config.TOWER_ROW).toInt())
-        if (top == null || tower == null) { lastX = -1f; return }
-        val cx = (top.first + top.second) / 2f
-        val tx = (tower.first + tower.second) / 2f
-        val dist = tx - cx
-        if (abs(dist) < Config.TOL_PX) { tap(); return }
-        if (lastX >= 0f && now > lastT) {
-            val v = (cx - lastX) / (now - lastT)
+        if (now < cooldownUntil) { lastX = -1f; return }
+        val mx = moverX(p, cur, w) ?: return
+        show(mx)
+        val dist = tx - mx
+        if (abs(dist) < Config.TOL_PX) { fire(); return }
+        if (lastX >= 0f && now > lastT && now - lastT < 120) {
+            val v = (mx - lastX) / (now - lastT)
             if (v != 0f && dist * v > 0f) {
                 val eta = dist / v
-                if (eta <= Config.LATENCY_MS + 40f) {
+                if (eta <= Config.LATENCY_MS + 30f) {
                     val delay = max(0L, (eta - Config.LATENCY_MS).toLong())
                     cooldownUntil = now + delay + Config.COOLDOWN_MS
-                    handler.postDelayed({ tap() }, delay)
+                    handler.postDelayed({ fire() }, delay)
                     lastX = -1f
                     return
                 }
             }
         }
-        lastX = cx
+        lastX = mx
         lastT = now
     }
 
-    private fun tap() {
+    private fun fire() {
         cooldownUntil = SystemClock.uptimeMillis() + Config.COOLDOWN_MS
         lastX = -1f
-        TapService.instance?.tap(Config.BTN_X * fullW, Config.BTN_Y * fullH)
+        TapService.instance?.tap(Config.TAP_X * fullW, Config.TAP_Y * fullH)
     }
 
     override fun onDestroy() {
